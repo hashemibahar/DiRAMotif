@@ -1,4 +1,4 @@
 # DiRAMotif
-###An Unsupervised Dirichlet-VAE Approach for RNA Motif Discovery
+#An Unsupervised Dirichlet-VAE Approach for RNA Motif Discovery
 
 This dataset was previously introduced in the iONMF study and is publicly accessible via the authors' code repository on GitHub (https://github.com/mstrazar/ionmf). The dataset comprises 31 independent experiments, covering 19 RNA-binding proteins (RBPs), including well-known examples such as Ago2, TIA1, and ELAVL1. All sequences were aligned to the human reference genome hg19. Specifically, this dataset includes 5,000 samples designated for the training phase and 2,000 samples for the testing phase, with each sample having a fixed length of 100 nucleotides
