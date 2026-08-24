@@ -5,7 +5,7 @@
 
 **DiRAMotif** is a pipeline for discovering candidate RNA-binding protein (RBP) motifs from CLIP-seq–derived RNA sequences. It combines k-mer frequency features, a Dirichlet-prior Variational Autoencoder (VAE), and biologically informed post-processing (enrichment, RNA accessibility, and positional centrality scoring) to produce ranked motif candidates and position weight matrices (PWMs) for each RBP.
 
-![pic](pic.png)
+![pic](pic.jpg)
 
 ## Overview
 
