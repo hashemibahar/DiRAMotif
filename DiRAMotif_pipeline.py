@@ -1,24 +1,6 @@
 """
 DiRAMotif — RNA-Binding Protein Motif Discovery Pipeline
-==========================================================
-This pipeline discovers candidate RNA-binding protein (RBP) motifs from
-CLIP-seq derived RNA sequences. It combines k-mer frequency features, a
-Dirichlet-prior Variational Autoencoder (VAE), and biologically informed
-post-processing (enrichment, accessibility, and centrality scoring) to
-produce ranked motif candidates and position weight matrices (PWMs).
 
-Key methodological notes:
-  - Position weight matrices are built from non-overlapping motif
-    occurrences, selected greedily by minimum Hamming distance, and
-    restricted to a central window of each peak sequence to reduce
-    edge noise.
-  - Pseudocounts scale with the number of observed occurrences rather
-    than using a fixed value, which avoids over-smoothing PWMs built
-    from a small number of sites.
-  - Motif comparison against reference databases (e.g., ATtRACT) is
-    performed with Tomtom, using empirical background nucleotide
-    frequencies (rather than a uniform assumption) and a minimum
-    overlap constraint proportional to motif length.
 """
 
 import os
@@ -26,9 +8,7 @@ import csv
 import glob
 import json
 import random
-import shutil
 import warnings
-import subprocess
 from collections import Counter, defaultdict
 
 import numpy as np
@@ -57,6 +37,7 @@ torch.manual_seed(42)
 DEVICE = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 print(f"Using device: {DEVICE}")
 
+
 # ============================================================================
 # Configuration
 # ============================================================================
@@ -65,25 +46,14 @@ TRAIN_SUFFIX = "_train.fasta"
 TEST_SUFFIX = "_test.fasta"
 ICSHAPE_SUFFIX = "_icshape.json"
 
-MIN_REAL_NEGATIVES_FOR_BACKGROUND = 200
 MAX_ICSHAPE_NULL_FRACTION = 0.5
 
 # Dropout rate used in the VAE architecture
 DROPOUT_RATE = 0.2
 
-# PWM construction parameters
-PWM_MAX_MISMATCHES = 1
-PWM_PSEUDOCOUNT_SCALE = 0.5          # relative pseudocount scaling factor (not an absolute value)
-PWM_MIN_PSEUDOCOUNT = 0.25           # minimum pseudocount applied even for very low occurrence counts
-PWM_CENTER_WINDOW_FRACTION = 0.6     # only the central 60% of each peak sequence is considered
-PWM_MIN_INFO_CONTENT = None          # e.g. 0.5 to filter out low-quality motifs;
-                                      # None = no filtering (still computed for reporting)
-
-# Tomtom parameters
-TOMTOM_MIN_OVERLAP = None            # None = computed automatically as max(k-1, 4)
-TOMTOM_EVALUE_THRESH = 10.0
-
-NUC_TO_IDX = {'A': 0, 'C': 1, 'G': 2, 'U': 3}
+# Early-stopping 
+EARLY_STOPPING_PATIENCE = 10
+EARLY_STOPPING_MIN_DELTA = 1e-4
 
 
 # ============================================================================
@@ -458,21 +428,14 @@ def normalize_enrichment_score(p_val):
     return 1 / (1 + np.exp(-(log_score - 2)))
 
 
-def rbp_specific_postprocessing(candidate_kmers, peak_seqs, peak_ids=None,
-                                 real_icshape=None, real_negative_seqs=None,
-                                 min_real_negatives=MIN_REAL_NEGATIVES_FOR_BACKGROUND):
-    if real_negative_seqs is not None and len(real_negative_seqs) >= min_real_negatives:
-        background_seqs = real_negative_seqs
-        background_source = "real_non_enriched_clip_background (experimentally derived negative set)"
-        print(f"    Background: using {len(background_seqs)} real negative sequences.")
-    else:
-        background_seqs = generate_dinucleotide_shuffled_background(peak_seqs, num_shuffles=5)
-        if len(background_seqs) == 0:
-            background_seqs = peak_seqs
-        background_source = "dinucleotide_shuffle"
-        n_avail = len(real_negative_seqs) if real_negative_seqs is not None else 0
-        print(f"    Background: available real negatives ({n_avail}) insufficient "
-              f"(minimum required={min_real_negatives}); using dinucleotide shuffle instead.")
+def rbp_specific_postprocessing(candidate_kmers, peak_seqs, peak_ids=None, real_icshape=None):
+    """
+    Multi-modal biological validation of candidate motifs.
+    """
+    background_seqs = generate_dinucleotide_shuffled_background(peak_seqs, num_shuffles=5)
+    if len(background_seqs) == 0:
+        background_seqs = peak_seqs
+    print(f"    Background: dinucleotide-shuffled sequences (n={len(background_seqs)}).")
 
     enrichment_results = calculate_enrichment_pvalue_and_qvalue(candidate_kmers, peak_seqs, background_seqs)
     accessibility_profiles, acc_summary = precompute_accessibility_profiles(
@@ -502,318 +465,15 @@ def rbp_specific_postprocessing(candidate_kmers, peak_seqs, peak_ids=None,
         }
 
     metadata = {
-        'background_source': background_source,
+        'background_source': 'dinucleotide_shuffle',
         'n_background_sequences': len(background_seqs),
-        'n_real_negatives_available': len(real_negative_seqs) if real_negative_seqs is not None else 0,
-        'min_real_negatives_required': min_real_negatives,
         **acc_summary,
     }
     return rbp_scores, metadata
 
 
 # ============================================================================
-# Section 4: Biologically grounded PWM construction
-# ============================================================================
-
-def _hamming_distance(a, b):
-    return sum(1 for x, y in zip(a, b) if x != y)
-
-
-def build_pwm_from_motif_occurrences(motif, peak_seqs,
-                                      max_mismatches=PWM_MAX_MISMATCHES,
-                                      pseudocount_scale=PWM_PSEUDOCOUNT_SCALE,
-                                      min_pseudocount=PWM_MIN_PSEUDOCOUNT,
-                                      center_window_fraction=PWM_CENTER_WINDOW_FRACTION,
-                                      min_info_content=PWM_MIN_INFO_CONTENT):
-    """
-    Builds a biologically grounded position weight matrix (PWM) for a motif,
-    with three key design choices:
-
-      (1) Non-overlapping occurrences, selected greedily by minimum Hamming
-          distance first (rather than counting every overlapping sliding
-          window separately).
-      (2) A relative pseudocount that scales with sqrt(occurrence_count),
-          instead of a fixed value that over-smooths PWMs built from a
-          small number of sites.
-      (3) A centrality filter: only occurrences near the center of each
-          peak sequence are counted, reducing noise from sites far from
-          the true binding location.
-
-    Returns (pwm, occurrence_count, mean_information_content_bits), or
-    None if no valid occurrence is found (or if min_info_content is set
-    and the resulting PWM does not meet the quality threshold).
-    """
-    motif = motif.upper().replace('T', 'U')
-    motif = ''.join(c for c in motif if c in NUC_TO_IDX)
-    motif_len = len(motif)
-    if motif_len == 0:
-        return None
-
-    position_counts = np.zeros((motif_len, 4))
-    occurrence_count = 0
-
-    for seq in peak_seqs:
-        clean_seq = seq.upper().replace('T', 'U')
-        clean_seq = ''.join(c for c in clean_seq if c in NUC_TO_IDX)
-        L = len(clean_seq)
-        if L < motif_len:
-            continue
-
-        # Restrict to the central region of the sequence to reduce edge noise
-        margin = int(L * (1 - center_window_fraction) / 2)
-        lo, hi = margin, L - margin - motif_len + 1
-        if hi <= lo:
-            lo, hi = 0, L - motif_len + 1
-
-        # Collect all candidate windows within the allowed Hamming distance
-        candidates = []
-        for start in range(lo, hi):
-            window = clean_seq[start:start + motif_len]
-            d = _hamming_distance(window, motif)
-            if d <= max_mismatches:
-                candidates.append((d, start, window))
-
-        # Greedy selection: best (lowest-mismatch) hits first, then non-overlapping
-        candidates.sort(key=lambda x: x[0])
-        used_positions = set()
-        for d, start, window in candidates:
-            span = range(start, start + motif_len)
-            if any(p in used_positions for p in span):
-                continue
-            used_positions.update(span)
-            for i, nuc in enumerate(window):
-                position_counts[i, NUC_TO_IDX[nuc]] += 1
-            occurrence_count += 1
-
-    if occurrence_count == 0:
-        return None
-
-    # Relative pseudocount, scaled by occurrence count
-    effective_pseudocount = max(min_pseudocount,
-                                 pseudocount_scale * np.sqrt(occurrence_count) / 10.0)
-    pfm_with_pseudocount = position_counts + effective_pseudocount
-    pwm = pfm_with_pseudocount / pfm_with_pseudocount.sum(axis=1, keepdims=True)
-
-    # Information content (used for reporting and optional filtering)
-    bg = 0.25
-    ic_per_col = np.sum(pwm * np.log2((pwm + 1e-9) / bg), axis=1)
-    mean_ic = float(np.mean(ic_per_col))
-
-    if min_info_content is not None and mean_ic < min_info_content:
-        return None  # motif does not meet the minimum PWM quality threshold
-
-    return pwm, occurrence_count, mean_ic
-
-
-def compute_background_frequencies(peak_seqs):
-    """Computes empirical nucleotide frequencies from the training sequences,
-    used both in the MEME output header and as the Tomtom -bfile input."""
-    counts = Counter()
-    for seq in peak_seqs:
-        clean = seq.upper().replace('T', 'U')
-        for c in clean:
-            if c in NUC_TO_IDX:
-                counts[c] += 1
-    total = sum(counts.values())
-    if total == 0:
-        return {'A': 0.25, 'C': 0.25, 'G': 0.25, 'U': 0.25}
-    return {nuc: counts.get(nuc, 0) / total for nuc in 'ACGU'}
-
-
-def export_pwms_to_meme_format(motif_pwm_dict, output_path, protein_name, background_freqs=None):
-    if background_freqs is None:
-        background_freqs = {'A': 0.25, 'C': 0.25, 'G': 0.25, 'U': 0.25}
-    with open(output_path, 'w') as f:
-        f.write("MEME version 4\n\n")
-        f.write("ALPHABET= ACGU\n\n")
-        f.write("strands: + -\n\n")
-        f.write("Background letter frequencies\n")
-        f.write(f"A {background_freqs['A']:.6f} C {background_freqs['C']:.6f} "
-                f"G {background_freqs['G']:.6f} U {background_freqs['U']:.6f}\n\n")
-        for motif, (pwm, n_sites, mean_ic) in motif_pwm_dict.items():
-            safe_name = f"{protein_name}_{motif}"
-            f.write(f"MOTIF {safe_name}\n")
-            f.write(f"letter-probability matrix: alength= 4 w= {pwm.shape[0]} nsites= {n_sites} E= 0\n")
-            for row in pwm:
-                f.write(" ".join(f"{v:.6f}" for v in row) + "\n")
-            f.write("\n")
-
-
-def build_and_export_all_motif_pwms(rbp_scores, peak_seqs, save_path, protein_name,
-                                     max_mismatches=PWM_MAX_MISMATCHES,
-                                     pseudocount_scale=PWM_PSEUDOCOUNT_SCALE,
-                                     min_pseudocount=PWM_MIN_PSEUDOCOUNT,
-                                     center_window_fraction=PWM_CENTER_WINDOW_FRACTION,
-                                     min_info_content=PWM_MIN_INFO_CONTENT):
-    """
-    Builds a PWM for every candidate motif in rbp_scores, using
-    non-overlapping occurrences, a relative pseudocount, and the
-    centrality filter implemented in build_pwm_from_motif_occurrences.
-    """
-    all_motifs = sorted(rbp_scores.items(), key=lambda x: x[1]['rbp_final_score'], reverse=True)
-    print(f"  Building PWMs (non-overlapping occurrences, relative pseudocount, "
-          f"centrality filter; max_mismatches={max_mismatches}) for "
-          f"all {len(all_motifs)} candidate motifs ...")
-
-    background_freqs = compute_background_frequencies(peak_seqs)
-    print(f"  Empirical nucleotide frequencies: "
-          f"A={background_freqs['A']:.3f} C={background_freqs['C']:.3f} "
-          f"G={background_freqs['G']:.3f} U={background_freqs['U']:.3f}")
-
-    motif_pwm_dict = {}
-    pwm_summary_rows = []
-    n_failed = 0
-
-    for kmer, scores in all_motifs:
-        result = build_pwm_from_motif_occurrences(
-            kmer, peak_seqs,
-            max_mismatches=max_mismatches,
-            pseudocount_scale=pseudocount_scale,
-            min_pseudocount=min_pseudocount,
-            center_window_fraction=center_window_fraction,
-            min_info_content=min_info_content,
-        )
-        if result is None:
-            n_failed += 1
-            continue
-        pwm, n_sites, mean_ic = result
-        motif_pwm_dict[kmer] = (pwm, n_sites, mean_ic)
-        pwm_summary_rows.append({
-            'motif': kmer,
-            'n_occurrences_used_for_pwm': n_sites,
-            'mean_information_content_bits': mean_ic,
-            'max_mismatches_allowed': max_mismatches,
-            'center_window_fraction': center_window_fraction,
-            'rbp_final_score': scores['rbp_final_score'],
-            'enrichment_pval': scores['enrichment_pval'],
-            'enrichment_qval': scores['enrichment_qval'],
-            'accessibility': scores['accessibility'],
-            'centrality': scores['centrality'],
-        })
-
-    meme_path = os.path.join(save_path, f'{protein_name}_ALL_motifs.meme')
-    export_pwms_to_meme_format(motif_pwm_dict, meme_path, protein_name, background_freqs=background_freqs)
-
-    # Background frequencies are also saved separately (for Tomtom's -bfile)
-    bg_path = os.path.join(save_path, f'{protein_name}_background.txt')
-    with open(bg_path, 'w') as f:
-        for nuc in 'ACGU':
-            f.write(f"{nuc}\t{background_freqs[nuc]:.6f}\n")
-
-    summary_csv_path = os.path.join(save_path, f'{protein_name}_ALL_pwm_summary.csv')
-    pd.DataFrame(pwm_summary_rows).to_csv(summary_csv_path, index=False)
-
-    print(f"  PWMs successfully built for {len(motif_pwm_dict)}/{len(all_motifs)} motifs "
-          f"({n_failed} rejected: zero occurrences or below quality threshold).")
-    print(f"  Full MEME file: {meme_path}")
-    print(f"  Background file (for Tomtom -bfile): {bg_path}")
-    print(f"  PWM summary (CSV): {summary_csv_path}")
-    return motif_pwm_dict, meme_path, bg_path
-
-
-# ============================================================================
-# Tomtom motif comparison
-# ============================================================================
-
-def run_tomtom_comparison(protein_meme_file, attract_meme_file, output_dir, protein_name,
-                           background_file=None, motif_len_for_overlap=6,
-                           qval_threshold=0.05):
-    """
-    Runs Tomtom to compare discovered motifs against a reference motif
-    database (e.g., ATtRACT).
-
-    Notes on the flags used:
-      - Small-sample correction (ssc) is left enabled, the recommended
-        MEME Suite default for PWMs built from a limited number of sites.
-      - "-bfile" is used when a background_file is provided, so Tomtom
-        scores matches against the empirical nucleotide frequencies
-        computed from the training sequences (rather than assuming a
-        uniform background).
-      - "-min-overlap" is set to max(motif_len - 1, 4), requiring an
-        almost-complete alignment rather than a short, noisy partial
-        match.
-    """
-    if shutil.which("tomtom") is None:
-        print("  Warning: 'tomtom' not found on PATH. Install the MEME Suite:")
-        print("     conda install -c bioconda meme")
-        return None
-
-    if not os.path.exists(attract_meme_file):
-        print(f"  Warning: ATtRACT MEME file not found: {attract_meme_file}")
-        return None
-
-    min_overlap = max(motif_len_for_overlap - 1, 4)
-
-    tomtom_out_dir = os.path.join(output_dir, f'{protein_name}_tomtom_out')
-    cmd = ["tomtom", "-oc", tomtom_out_dir,
-           "-min-overlap", str(min_overlap),
-           "-dist", "pearson",
-           "-evalue", "-thresh", str(TOMTOM_EVALUE_THRESH)]
-
-    if background_file is not None and os.path.exists(background_file):
-        cmd += ["-bfile", background_file]
-        print(f"  Using empirical background frequencies: {background_file}")
-    else:
-        print("  No background file provided; Tomtom will use its default uniform assumption.")
-
-    cmd += [protein_meme_file, attract_meme_file]
-
-    try:
-        subprocess.run(cmd, check=True, capture_output=True, text=True, timeout=1200)
-    except subprocess.CalledProcessError as e:
-        print(f"  Error: Tomtom failed: {str(e.stderr)[:300]}")
-        return None
-    except subprocess.TimeoutExpired:
-        print("  Error: Tomtom timed out.")
-        return None
-
-    tomtom_tsv = os.path.join(tomtom_out_dir, "tomtom.tsv")
-    if not os.path.exists(tomtom_tsv):
-        print("  Error: tomtom.tsv output file not found.")
-        return None
-
-    try:
-        tomtom_df = pd.read_csv(tomtom_tsv, sep='\t', comment='#')
-        tomtom_df.columns = [c.strip() for c in tomtom_df.columns]
-        tomtom_df = tomtom_df.dropna(subset=['Query_ID']) if 'Query_ID' in tomtom_df.columns else tomtom_df
-    except Exception as e:
-        print(f"  Error reading tomtom.tsv: {e}")
-        return None
-
-    qcol = 'q-value' if 'q-value' in tomtom_df.columns else [c for c in tomtom_df.columns if 'q' in c.lower()][0]
-    qcol_id = 'Query_ID' if 'Query_ID' in tomtom_df.columns else tomtom_df.columns[0]
-
-    significant = tomtom_df[tomtom_df[qcol] < qval_threshold] if not tomtom_df.empty else tomtom_df
-
-    query_motifs_all = set()
-    with open(protein_meme_file) as f:
-        for line in f:
-            if line.startswith("MOTIF"):
-                query_motifs_all.add(line.split()[1])
-
-    matched_motifs = set(significant[qcol_id].unique()) if not significant.empty else set()
-    agreement_pct = 100.0 * len(matched_motifs) / len(query_motifs_all) if query_motifs_all else 0.0
-
-    tomtom_df.to_csv(os.path.join(output_dir, f'{protein_name}_tomtom_full_results.csv'), index=False)
-
-    summary = {
-        'protein': protein_name,
-        'n_query_motifs': len(query_motifs_all),
-        'n_significant_matches_qlt0.05': len(matched_motifs),
-        'tomtom_agreement_pct': agreement_pct,
-        'min_overlap_used': min_overlap,
-        'background_file_used': background_file if background_file else 'uniform_default',
-    }
-    pd.DataFrame([summary]).to_csv(
-        os.path.join(output_dir, f'{protein_name}_tomtom_agreement_summary.csv'), index=False
-    )
-    print(f"  Tomtom: {len(matched_motifs)}/{len(query_motifs_all)} motifs "
-          f"({agreement_pct:.1f}%) had a significant match (q<{qval_threshold}) to the reference database.")
-    return summary
-
-
-# ============================================================================
-# Section 5: VAE evaluation metrics
+# Section 4: VAE evaluation metrics
 # ============================================================================
 
 ACTIVE_UNIT_VARIANCE_THRESHOLD = 0.01
@@ -875,19 +535,29 @@ def calculate_vae_metrics(all_z_values, vae_model, dataloader, recon_percentile=
 
 
 # ============================================================================
-# Section 6: Training with a real train/test holdout split
+# Section 5: Training with a real train/test holdout split
 # ============================================================================
 
 def train_vae_with_real_holdout(X_train, X_test, input_dim, hidden_dim, latent_dim,
                                   epochs=100, batch_size=128, lr=1e-3, weight_decay=1e-5,
-                                  prior_alpha=0.1, dropout_rate=DROPOUT_RATE, verbose=True):
+                                  prior_alpha=0.1, dropout_rate=DROPOUT_RATE, verbose=True,
+                                  early_stopping=True,
+                                  patience=EARLY_STOPPING_PATIENCE,
+                                  min_delta=EARLY_STOPPING_MIN_DELTA):
+
     model = VAE_Dirichlet(input_dim, hidden_dim, latent_dim, dropout_rate=dropout_rate).to(DEVICE)
     optimizer = optim.Adam(model.parameters(), lr=lr, weight_decay=weight_decay)
 
     train_loader = DataLoader(RNADataset(X_train), batch_size=batch_size, shuffle=True)
     test_loader = DataLoader(RNADataset(X_test), batch_size=batch_size, shuffle=False)
 
-    history = {'train_recon': [], 'train_kl': [], 'test_recon': [], 'test_kl': []}
+    history = {'train_recon': [], 'train_kl': [], 'test_recon': [], 'test_kl': [],
+               'early_stopped': False, 'stopped_epoch': None, 'best_epoch': None}
+
+    best_val_loss = float('inf')
+    best_epoch = -1
+    epochs_without_improvement = 0
+    best_state_dict = None
 
     for epoch in range(epochs):
         model.train()
@@ -915,13 +585,42 @@ def train_vae_with_real_holdout(X_train, X_test, input_dim, hidden_dim, latent_d
                 _, recon_l, kl_l = dirichlet_loss_split(recon_batch, batch, alpha, prior_alpha)
                 test_recon += recon_l.item()
                 test_kl += kl_l.item()
-        history['test_recon'].append(test_recon / len(test_loader.dataset))
-        history['test_kl'].append(test_kl / len(test_loader.dataset))
+        test_recon_avg = test_recon / len(test_loader.dataset)
+        test_kl_avg = test_kl / len(test_loader.dataset)
+        history['test_recon'].append(test_recon_avg)
+        history['test_kl'].append(test_kl_avg)
+
+        val_loss = test_recon_avg + test_kl_avg
 
         if verbose and ((epoch + 1) % 10 == 0 or epoch == 0):
             print(f"    Epoch {epoch+1:3d}/{epochs} | "
                   f"Train Recon={history['train_recon'][-1]:.4f} KL={history['train_kl'][-1]:.4f} | "
-                  f"Test Recon={history['test_recon'][-1]:.4f} KL={history['test_kl'][-1]:.4f}")
+                  f"Test Recon={history['test_recon'][-1]:.4f} KL={history['test_kl'][-1]:.4f} | "
+                  f"ValLoss={val_loss:.6f}")
+
+        if early_stopping:
+            if val_loss < best_val_loss - min_delta:
+                best_val_loss = val_loss
+                best_epoch = epoch
+                epochs_without_improvement = 0
+                best_state_dict = {k: v.detach().clone() for k, v in model.state_dict().items()}
+            else:
+                epochs_without_improvement += 1
+
+            if epochs_without_improvement >= patience:
+                history['early_stopped'] = True
+                history['stopped_epoch'] = epoch + 1
+                if verbose:
+                    print(f"    Early stopping triggered at epoch {epoch + 1} "
+                          f"(no improvement > {min_delta} in validation loss for {patience} epochs). "
+                          f"Restoring weights from epoch {best_epoch + 1}.")
+                break
+
+    if early_stopping and best_state_dict is not None:
+        model.load_state_dict(best_state_dict)
+        history['best_epoch'] = best_epoch + 1
+    else:
+        history['best_epoch'] = len(history['train_recon'])
 
     return model, history, train_loader, test_loader
 
@@ -984,7 +683,7 @@ def plot_diagnostic_figures(all_z_train, X_train, model, train_loader, save_path
 
 
 # ============================================================================
-# Section 7: Sensitivity analysis over latent_dim
+# Section 6: Sensitivity analysis over latent_dim
 # ============================================================================
 
 def run_latent_dim_sensitivity(X_train, X_test, input_dim, hidden_dim, save_path, protein_name,
@@ -1040,7 +739,7 @@ def run_latent_dim_sensitivity(X_train, X_test, input_dim, hidden_dim, save_path
 
 
 # ============================================================================
-# Section 7.5: Multi-k robustness analysis (Table 5)
+# Section 7: Multi-k robustness analysis
 # ============================================================================
 
 def run_multi_k_robustness_analysis(train_sequences, test_sequences, save_path, protein_name,
@@ -1091,9 +790,9 @@ def run_multi_k_robustness_analysis(train_sequences, test_sequences, save_path, 
         })
 
     df = pd.DataFrame(rows)
-    table5_path = os.path.join(save_path, f'{protein_name}_table5_multi_k_robustness.csv')
-    df.to_csv(table5_path, index=False)
-    print(f"  Table 5 (multi-k robustness) for {protein_name} saved to {table5_path}")
+    table6_path = os.path.join(save_path, f'{protein_name}_table6_multi_k_robustness.csv')
+    df.to_csv(table6_path, index=False)
+    print(f"  Table 6 (multi-k robustness) for {protein_name} saved to {table6_path}")
     return df, results_per_k
 
 
@@ -1199,41 +898,14 @@ def save_rbp_motif_report(rbp_scores, save_path, protein_name, metadata=None):
 
 
 # ============================================================================
-# Output storage (local or Google Drive when run in Colab)
-# ============================================================================
-
-def setup_output_root(drive_subfolder="DiRAMotif_results", prefer_drive=True):
-    if prefer_drive:
-        try:
-            from google.colab import drive  # noqa: F401
-            drive.mount('/content/drive', force_remount=False)
-            output_root = f'/content/drive/MyDrive/{drive_subfolder}'
-            os.makedirs(output_root, exist_ok=True)
-            print(f"Google Drive mounted. Results will be saved to:\n   {output_root}")
-            return output_root
-        except ImportError:
-            pass
-
-    output_root = f'./{drive_subfolder}'
-    os.makedirs(output_root, exist_ok=True)
-    print(f"Results will be saved locally to: {os.path.abspath(output_root)}")
-    return output_root
-
-
-# ============================================================================
 # Section 9: Full pipeline for a single protein
 # ============================================================================
 
 def run_full_pipeline_for_protein(protein_name, train_fasta, test_fasta,
-                                    negative_fasta=None, icshape_json=None,
+                                    icshape_json=None,
                                     k=6, hidden_dim=200, latent_dim=30, epochs=100,
                                     dropout_rate=DROPOUT_RATE,
                                     run_sensitivity=True, run_multi_k=False,
-                                    attract_meme_file=None,
-                                    pwm_max_mismatches=PWM_MAX_MISMATCHES,
-                                    pwm_pseudocount_scale=PWM_PSEUDOCOUNT_SCALE,
-                                    pwm_center_window_fraction=PWM_CENTER_WINDOW_FRACTION,
-                                    pwm_min_info_content=PWM_MIN_INFO_CONTENT,
                                     output_root="./rna_motif_results"):
 
     save_path = os.path.join(output_root, protein_name)
@@ -1249,13 +921,6 @@ def run_full_pipeline_for_protein(protein_name, train_fasta, test_fasta,
     train_sequences = [r[1] for r in train_records]
     test_sequences = [r[1] for r in test_records]
     print(f"  Number of sequences - train: {len(train_sequences)} | test: {len(test_sequences)}")
-
-    negative_sequences = None
-    if negative_fasta is not None and os.path.exists(negative_fasta):
-        negative_sequences = load_fasta_sequences(negative_fasta)
-        print(f"  Number of real negative sequences: {len(negative_sequences)}")
-    else:
-        print("  No negative-set file available; falling back to dinucleotide shuffle.")
 
     real_icshape = load_icshape_scores(icshape_json) if icshape_json else {}
     if real_icshape:
@@ -1308,8 +973,7 @@ def run_full_pipeline_for_protein(protein_name, train_fasta, test_fasta,
     print("  Scoring motifs biologically (enrichment + accessibility + centrality) ...")
     rbp_scores, postproc_meta = rbp_specific_postprocessing(
         all_candidate_kmers, train_sequences,
-        peak_ids=train_ids, real_icshape=real_icshape,
-        real_negative_seqs=negative_sequences
+        peak_ids=train_ids, real_icshape=real_icshape
     )
     csv_path = save_rbp_motif_report(rbp_scores, save_path, protein_name, metadata=postproc_meta)
 
@@ -1317,36 +981,15 @@ def run_full_pipeline_for_protein(protein_name, train_fasta, test_fasta,
     top_15_motifs = [kmer for kmer, _ in sorted_rbp_motifs[:15]]
     plot_motif_activity_heatmap(top_kmers, top_15_motifs, save_path, protein_name)
 
-    # Biologically grounded PWM construction for all candidate motifs in the CSV
-    print("  Building biologically grounded PWMs (non-overlapping occurrences, "
-          "relative pseudocount, centrality filter) for all candidate motifs ...")
-    motif_pwm_dict, meme_path, bg_path = build_and_export_all_motif_pwms(
-        rbp_scores, train_sequences, save_path, protein_name,
-        max_mismatches=pwm_max_mismatches,
-        pseudocount_scale=pwm_pseudocount_scale,
-        center_window_fraction=pwm_center_window_fraction,
-        min_info_content=pwm_min_info_content,
-    )
-
-    tomtom_summary = None
-    if attract_meme_file is not None:
-        tomtom_summary = run_tomtom_comparison(
-            meme_path, attract_meme_file, save_path, protein_name,
-            background_file=bg_path,
-            motif_len_for_overlap=k,
-        )
-    else:
-        print("  No attract_meme_file provided; skipping Tomtom comparison step.")
-
     sensitivity_df = None
     if run_sensitivity:
         sensitivity_df = run_latent_dim_sensitivity(
             X_train, X_test, input_dim, hidden_dim, save_path, protein_name
         )
 
-    table5_df = None
+    table6_df = None
     if run_multi_k:
-        table5_df, _ = run_multi_k_robustness_analysis(
+        table6_df, _ = run_multi_k_robustness_analysis(
             train_sequences, test_sequences, save_path, protein_name,
             hidden_dim=hidden_dim, latent_dim=latent_dim, epochs=epochs
         )
@@ -1370,6 +1013,13 @@ def run_full_pipeline_for_protein(protein_name, train_fasta, test_fasta,
         "normalization": "LayerNorm (encoder and decoder)",
         "dropout": dropout_rate,
         "device": str(DEVICE),
+        "early_stopping_enabled": True,
+        "early_stopping_patience": EARLY_STOPPING_PATIENCE,
+        "early_stopping_min_delta": EARLY_STOPPING_MIN_DELTA,
+        "early_stopped": history.get('early_stopped', False),
+        "stopped_epoch": history.get('stopped_epoch'),
+        "best_epoch": history.get('best_epoch'),
+        "n_epochs_actually_trained": len(history['train_recon']),
         "active_unit_variance_threshold": ACTIVE_UNIT_VARIANCE_THRESHOLD,
         "sparsity_near_zero_threshold": SPARSITY_NEAR_ZERO_THRESHOLD,
         "n_train_sequences": len(train_sequences),
@@ -1378,23 +1028,8 @@ def run_full_pipeline_for_protein(protein_name, train_fasta, test_fasta,
         "final_score_formula": "0.5*Enrichment_norm + 0.3*Accessibility + 0.2*Centrality",
         "run_sensitivity_analysis": run_sensitivity,
         "run_multi_k_robustness_analysis": run_multi_k,
-        "tomtom_comparison_run": tomtom_summary is not None,
-        # PWM construction settings
-        "pwm_construction_method": "non_overlapping_greedy_best_hit_first_with_centrality_filter",
-        "pwm_max_mismatches": pwm_max_mismatches,
-        "pwm_pseudocount_scale": pwm_pseudocount_scale,
-        "pwm_min_pseudocount": PWM_MIN_PSEUDOCOUNT,
-        "pwm_center_window_fraction": pwm_center_window_fraction,
-        "pwm_min_info_content_filter": pwm_min_info_content,
-        "pwm_built_for_all_candidate_motifs": True,
-        "n_motifs_with_pwm": len(motif_pwm_dict),
         "n_total_candidate_motifs": len(all_candidate_kmers),
-        # Tomtom settings
-        "tomtom_small_sample_correction": "enabled",
-        "tomtom_min_overlap": max(k - 1, 4),
-        "tomtom_background_file_used": bg_path,
         # Data sources
-        "negative_fasta_used": negative_fasta if negative_sequences is not None else None,
         "icshape_json_used": icshape_json if real_icshape else None,
         **postproc_meta,
     }
@@ -1414,24 +1049,27 @@ def run_full_pipeline_for_protein(protein_name, train_fasta, test_fasta,
         'train_active_units_ratio': metrics_train['active_units_ratio'],
         'test_active_units_ratio': metrics_test['active_units_ratio'],
         'n_candidate_motifs': len(all_candidate_kmers),
-        'n_motifs_with_pwm': len(motif_pwm_dict),
         'top_motif': sorted_rbp_motifs[0][0] if sorted_rbp_motifs else None,
         'top_motif_score': sorted_rbp_motifs[0][1]['rbp_final_score'] if sorted_rbp_motifs else None,
-        'tomtom_agreement_pct': tomtom_summary['tomtom_agreement_pct'] if tomtom_summary else None,
         'background_source': postproc_meta.get('background_source'),
         'accessibility_source': postproc_meta.get('accessibility_source'),
         'n_real_icshape_used': postproc_meta.get('n_real_icshape_used'),
         'dropout_rate': dropout_rate,
+        'early_stopped': history.get('early_stopped', False),
+        'stopped_epoch': history.get('stopped_epoch'),
+        'best_epoch': history.get('best_epoch'),
+        'n_epochs_actually_trained': len(history['train_recon']),
+       
     }
 
 
 # ============================================================================
-# Section 10: Discovering train/test/negative/icSHAPE file sets and batch execution
+# Section 10: Discovering train/test/icSHAPE file sets and batch execution
 # ============================================================================
 
 def discover_protein_dataset_pairs(data_dir=DEFAULT_DATA_DIR,
                                     train_suffix=TRAIN_SUFFIX, test_suffix=TEST_SUFFIX,
-                                    negative_suffix=NEGATIVE_SUFFIX, icshape_suffix=ICSHAPE_SUFFIX):
+                                    icshape_suffix=ICSHAPE_SUFFIX):
     train_files = glob.glob(os.path.join(data_dir, f"*{train_suffix}"))
     pairs = {}
     for train_path in train_files:
@@ -1441,12 +1079,10 @@ def discover_protein_dataset_pairs(data_dir=DEFAULT_DATA_DIR,
         if not os.path.exists(test_path):
             print(f"Warning: test file for {protein_name} not found ({test_path}); skipping this protein.")
             continue
-        negative_path = os.path.join(data_dir, f"{protein_name}{negative_suffix}")
         icshape_path = os.path.join(data_dir, f"{protein_name}{icshape_suffix}")
         pairs[protein_name] = {
             'train': train_path,
             'test': test_path,
-            'negative': negative_path if os.path.exists(negative_path) else None,
             'icshape': icshape_path if os.path.exists(icshape_path) else None,
         }
     return pairs
@@ -1457,18 +1093,11 @@ def run_batch_pipeline(data_dir=DEFAULT_DATA_DIR, output_root="./rna_motif_resul
                         dropout_rate=DROPOUT_RATE,
                         run_sensitivity_for_all=False, sensitivity_subset_size=5,
                         run_multi_k_for_all=False, multi_k_subset_size=5,
-                        attract_meme_file=None,
-                        pwm_max_mismatches=PWM_MAX_MISMATCHES,
-                        pwm_pseudocount_scale=PWM_PSEUDOCOUNT_SCALE,
-                        pwm_center_window_fraction=PWM_CENTER_WINDOW_FRACTION,
-                        pwm_min_info_content=PWM_MIN_INFO_CONTENT,
                         priority_sensitivity_proteins=None):
     os.makedirs(output_root, exist_ok=True)
     pairs = discover_protein_dataset_pairs(data_dir)
     print(f"\nNumber of protein/cell-line datasets found (both train and test present): {len(pairs)}")
-    n_with_negative = sum(1 for p in pairs.values() if p['negative'] is not None)
     n_with_icshape = sum(1 for p in pairs.values() if p['icshape'] is not None)
-    print(f"   With real negative-set file: {n_with_negative}/{len(pairs)}")
     print(f"   With real icSHAPE file: {n_with_icshape}/{len(pairs)}")
 
     protein_names = list(pairs.keys())
@@ -1488,7 +1117,7 @@ def run_batch_pipeline(data_dir=DEFAULT_DATA_DIR, output_root="./rna_motif_resul
         shuffled = protein_names.copy()
         random.shuffle(shuffled)
         multi_k_targets = set(shuffled[:multi_k_subset_size])
-        print(f"   (multi-k robustness analysis [Table 5] limited to {multi_k_subset_size} sampled proteins: "
+        print(f"   (multi-k robustness analysis [Table 6] limited to {multi_k_subset_size} sampled proteins: "
               f"{sorted(multi_k_targets)})")
 
     summary_rows = []
@@ -1496,16 +1125,11 @@ def run_batch_pipeline(data_dir=DEFAULT_DATA_DIR, output_root="./rna_motif_resul
         try:
             result = run_full_pipeline_for_protein(
                 protein_name, paths['train'], paths['test'],
-                negative_fasta=paths['negative'], icshape_json=paths['icshape'],
+                icshape_json=paths['icshape'],
                 k=k, hidden_dim=hidden_dim, latent_dim=latent_dim, epochs=epochs,
                 dropout_rate=dropout_rate,
                 run_sensitivity=(protein_name in sensitivity_targets),
                 run_multi_k=(protein_name in multi_k_targets),
-                attract_meme_file=attract_meme_file,
-                pwm_max_mismatches=pwm_max_mismatches,
-                pwm_pseudocount_scale=pwm_pseudocount_scale,
-                pwm_center_window_fraction=pwm_center_window_fraction,
-                pwm_min_info_content=pwm_min_info_content,
                 output_root=output_root
             )
             summary_rows.append(result)
@@ -1519,12 +1143,10 @@ def run_batch_pipeline(data_dir=DEFAULT_DATA_DIR, output_root="./rna_motif_resul
     print(f"\n{'='*90}\nFinal summary for all proteins saved to {summary_path}")
     print(f"Total proteins processed successfully: {len(summary_df)}")
     if len(summary_df) > 0:
-        print(f"Proteins that used a real negative-set background: "
-              f"{(summary_df['background_source'] == 'real_non_enriched_clip_background (experimentally derived negative set)').sum()}")
         print(f"Proteins that used (at least partially) real icSHAPE data: "
               f"{(summary_df['n_real_icshape_used'].fillna(0) > 0).sum()}")
-        print(f"Mean number of motifs with a PWM per protein: "
-              f"{summary_df['n_motifs_with_pwm'].mean():.1f}")
+        print(f"Proteins for which early stopping triggered: "
+              f"{summary_df['early_stopped'].sum()}/{len(summary_df)}")
     print(f"{'='*90}")
     return summary_df
 
@@ -1534,8 +1156,9 @@ def run_batch_pipeline(data_dir=DEFAULT_DATA_DIR, output_root="./rna_motif_resul
 # ============================================================================
 if __name__ == "__main__":
     DATA_DIR = "/content/data"
-    OUTPUT_ROOT = setup_output_root(drive_subfolder="DiRAMotif_results", prefer_drive=True)
-    ATTRACT_MEME_FILE = None  # path to the converted ATtRACT MEME file, if available
+    OUTPUT_ROOT = "./DiRAMotif_results"
+    os.makedirs(OUTPUT_ROOT, exist_ok=True)
+    print(f"Results will be saved locally to: {os.path.abspath(OUTPUT_ROOT)}")
 
     PRIORITY_SENSITIVITY_PROTEINS = [
         "AGO2_HEK293", "AGO2_HeLa", "EIF4A3_HEK293", "U2AF2_HepG2", "HNRNPC_HeLa",
@@ -1553,11 +1176,6 @@ if __name__ == "__main__":
         sensitivity_subset_size=5,
         run_multi_k_for_all=False,
         multi_k_subset_size=5,
-        attract_meme_file=ATTRACT_MEME_FILE,
-        pwm_max_mismatches=PWM_MAX_MISMATCHES,
-        pwm_pseudocount_scale=PWM_PSEUDOCOUNT_SCALE,
-        pwm_center_window_fraction=PWM_CENTER_WINDOW_FRACTION,
-        pwm_min_info_content=PWM_MIN_INFO_CONTENT,
         priority_sensitivity_proteins=PRIORITY_SENSITIVITY_PROTEINS,
     )
 
