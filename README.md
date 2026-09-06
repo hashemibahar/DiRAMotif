@@ -109,5 +109,5 @@ A combined summary_all_proteins.csv is written to output_root when running in ba
 
 ## Citation
 
-If you use this pipeline in your research, please cite the associated paper (citation details to be added upon publication).
+If you use this pipeline in your research, please cite the associated paper.
 
