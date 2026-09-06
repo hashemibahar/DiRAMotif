@@ -66,25 +66,6 @@ Two CLIP-seq dataset sources were used in the accompanying study:
 
 ## Usage
 
-### Single protein
-
-```python
-from DiRAMotif_pipeline import run_full_pipeline_for_protein
-
-result = run_full_pipeline_for_protein(
-    protein_name="EIF4A3_HEK293",
-    train_fasta="data/EIF4A3_HEK293_train.fasta",
-    test_fasta="data/EIF4A3_HEK293_test.fasta",
-    icshape_json="data/EIF4A3_HEK293_icshape.json",        # optional
-    k=6,
-    hidden_dim=200,
-    latent_dim=30,
-    epochs=100,
-    attract_meme_file="attract_db.meme",                   # optional
-    output_root="./rna_motif_results",
-)
-```
-
 ### Batch mode (all proteins in a data directory)
 
 ```python
@@ -112,25 +93,21 @@ Edit the `DATA_DIR`, `OUTPUT_ROOT`, and `ATTRACT_MEME_FILE` variables at the bot
 
 ## Output
 
-For each protein, the pipeline writes to `{output_root}/{protein_name}/`:
+For each protein, the pipeline writes to {output_root}/{protein_name}/:
 
-- `*_model_weights.pth` — trained VAE weights
-- `*_loss_curves.jpg`, `*_loss_history.json` — training diagnostics
-- `*_latent_heatmap.jpg`, `*_latent_distribution.jpg`, `*_reconstruction_error_dist.jpg` — latent-space diagnostics
-- `*_rbp_specific_motif_report.txt`, `*_rbp_motif_scores.csv` — ranked candidate motifs with enrichment, accessibility, and centrality scores
-- `*_motif_activity_heatmap.jpg` — motif activity across latent dimensions
-- `*motifs.meme`, `*pwm_summary.csv`, `*_background.txt` — PWMs in MEME format, per-motif PWM statistics, and background nucleotide frequencies
-- `*_tomtom_out/`, `*_tomtom_full_results.csv`, `*_tomtom_agreement_summary.csv` — Tomtom comparison results (if `attract_meme_file` is provided)
-- `*_latent_dim_sensitivity.csv/.jpg` — latent-dimension sensitivity analysis (optional)
-- `*_table5_multi_k_robustness.csv` — multi-*k* robustness analysis (optional)
-- `*_run_config.json` — full configuration used for the run
+*_model_weights.pth — trained VAE weights (best checkpoint, if early stopping triggered)
+*_loss_curves.jpg, *_loss_history.json — training diagnostics, including whether early stopping triggered and at which epoch
+*_latent_heatmap.jpg, *_latent_distribution.jpg, *_reconstruction_error_dist.jpg — latent-space diagnostics
+*_vae_metrics_train.json, *_vae_metrics_test.json — reconstruction error, sparsity, and active-units-ratio metrics
+*_rbp_specific_motif_report.txt, *_rbp_motif_scores.csv — ranked candidate motifs with enrichment, accessibility, and centrality scores
+*_motif_activity_heatmap.jpg — motif activity across latent dimensions
+*_latent_dim_sensitivity.csv/.jpg — latent-dimension sensitivity analysis (optional, run_sensitivity=True)
+*_table6_multi_k_robustness.csv — multi-k robustness analysis (optional, run_multi_k=True)
+*_run_config.json — full configuration used for the run, including early-stopping settings and outcome
 
-A combined `summary_all_proteins.csv` is written to `output_root` when running in batch mode.
+A combined summary_all_proteins.csv is written to output_root when running in batch mode.
 
 ## Citation
 
 If you use this pipeline in your research, please cite the associated paper (citation details to be added upon publication).
 
-## License
-
-Add your chosen license here (e.g., MIT, Apache-2.0, GPL-3.0).
